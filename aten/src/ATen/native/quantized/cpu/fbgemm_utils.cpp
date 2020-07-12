@@ -299,7 +299,7 @@ CAFFE2_API torch::class_<ConvPackedParamsBase<kSpatialDim>> register_conv_params
             }
             groups = scalars_tensor[1].item<int64_t>();
             switch (version) {
-              case 2: break;
+              case 2: break;  // V2 is already covered, skipping output_padding
               case 3: {
                 for (; idx < 4 * kSpatialDim; ++idx) {
                   at::Tensor p = params1_tensor[idx];
@@ -322,8 +322,10 @@ CAFFE2_API torch::class_<ConvPackedParamsBase<kSpatialDim>> register_conv_params
                 bias,
                 stride,
                 padding,
+                output_padding,
                 dilation,
-                groups);
+                groups,
+                transpose);
           }
 #endif // USE_FBGEMM
 #ifdef USE_PYTORCH_QNNPACK
@@ -337,8 +339,10 @@ CAFFE2_API torch::class_<ConvPackedParamsBase<kSpatialDim>> register_conv_params
                 bias,
                 stride,
                 padding,
+                output_padding,
                 dilation,
-                groups);
+                groups,
+                transpose);
           }
 #endif // USE_PYTORCH_QNNPACK
           TORCH_CHECK(
