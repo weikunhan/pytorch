@@ -7,6 +7,7 @@
 #include <THC/THC.h>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/core/StreamGuard.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include <c10d/Utils.hpp>
@@ -59,10 +60,24 @@ std::map<at::ScalarType, ncclDataType_t> ncclDataType = {
 
 // Helper function that gets the data type and issues error if not supported
 ncclDataType_t getNcclDataType(at::ScalarType type) {
-  try {
-    return ncclDataType.at(type);
-  } catch (std::out_of_range& e) {
-    throw std::runtime_error("Unsupported data type for NCCL process group");
+  auto it = ncclDataType.find(type);
+  if (it == ncclDataType.end()) {
+    // Input tensor is of an unsupported type.
+    auto err = c10::str(
+        "Input tensor data type is not supported for NCCL process group: ",
+        type);
+    TORCH_CHECK(false, err);
+  }
+  return it->second;
+}
+
+// Helper function that casts tensors from bool to long.
+void castTensorsFromBool(std::vector<at::Tensor>& tensors) {
+  for (auto& tensor : tensors) {
+    // TODO: a simple tensor = tensor.to(long) won't work here. The allreduce
+    // will be correct, but the modified tensor won't be reflected in Python.
+    auto asIntBufTensor = tensor.to(at::kLong);
+    tensor.set_data(asIntBufTensor);
   }
 }
 
@@ -656,6 +671,15 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::collective(
     Fn fn,
     PreProcess pre,
     PostProcess post) {
+  auto requiresBoolConversion =
+      inputs.size() > 0 && inputs[0].scalar_type() == at::ScalarType::Bool;
+  if (requiresBoolConversion) {
+    castTensorsFromBool(inputs);
+    if (&inputs != &outputs) {
+      castTensorsFromBool(outputs);
+    }
+  }
+
   const auto devices = getDeviceList(inputs);
   const auto key = getKeyFromDevices(devices);
   auto& ncclComms = getNCCLComm(key, devices);
@@ -693,6 +717,36 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::collective(
       at::cuda::CUDAStream& ncclStream = ncclStreams_[key][i];
       C10D_NCCL_CHECK(
           fn(inputs[i], outputs[i], ncclComms[i]->getNcclComm(), ncclStream));
+    }
+  }
+
+  // This needs to be outside of the nccl_group-guard due to
+  // https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html:
+  // Caution: When called inside a group, stream operations (like ncclAllReduce)
+  // can return without having enqueued the operation on the stream. Stream
+  // operations like cudaStreamSynchronize can therefore be called only after
+  // ncclGroupEnd returns.
+
+  // Run conversion back on the same ncclStream
+  if (requiresBoolConversion) {
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      {
+        at::cuda::CUDAStreamGuard guard(ncclStreams_[key][i]);
+        auto asBoolTensor = outputs[i].to(at::kBool);
+        // TODO: the simple t = t.to(bool) doesn't work similar to above.
+        outputs[i].set_data(asBoolTensor);
+      }
+    }
+
+    if (&inputs != &outputs) {
+      // Inputs and outputs differ, so we expect inputs not to be modified.
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        {
+          at::cuda::CUDAStreamGuard guard(ncclStreams_[key][i]);
+          auto boolTensor = inputs[i].to(at::kBool);
+          inputs[i].set_data(boolTensor);
+        }
+      }
     }
   }
 
